@@ -3,14 +3,14 @@ import pandas as pd
 import math
 import requests
 
-# --- PAGE CONFIGURATION (Must be first) ---
+# --- 1. PAGE CONFIG (Must be the very first command) ---
 st.set_page_config(
     page_title="Field Ops Optimizer",
     page_icon="🚛",
     layout="wide"
 )
 
-# --- THE LOGIC BRAIN (Hidden from User) ---
+# --- 2. THE BRAIN (Logic Class) ---
 class RouteOptimizer:
     def __init__(self, office_coords, day_start=9.0):
         self.office = office_coords
@@ -32,17 +32,21 @@ class RouteOptimizer:
 
     def load_from_csv(self, file_path):
         try:
-            df = pd.read_csv(file_path)
+            # Try reading with different encodings to handle emojis safely
+            try:
+                df = pd.read_csv(file_path, encoding='utf-8')
+            except UnicodeDecodeError:
+                df = pd.read_csv(file_path, encoding='cp1252')
             
-            # --- 🔍 CRITICAL FILTER APPLIED HERE ---
-            # Only keep rows where Status is "Inspection Pending"
+            # --- ROBUST FILTER ---
+            # Looks for "Inspection Pending" text, ignoring emojis/garbage characters
             if 'Internal/Status' in df.columns:
-                df = df[df['Internal/Status'] == "⚙️Inspection Pending"]
+                df = df[df['Internal/Status'].astype(str).str.contains("Inspection Pending", case=False, na=False)]
             
             self.candidates = [] 
             for index, row in df.iterrows():
                 try:
-                    # Coordinate Cleaning
+                    # Clean Coordinates
                     raw_lat = str(row['Building/Lat']).replace('"', '').strip()
                     if ',' in raw_lat:
                         parts = raw_lat.split(',')
@@ -53,8 +57,8 @@ class RouteOptimizer:
                     self.candidates.append({
                         'id': row['House_ID'], 
                         'coords': (lat, lon), 
-                        'lat': lat, # For Map
-                        'lon': lon, # For Map
+                        'lat': lat, # Explicitly save for Map
+                        'lon': lon, # Explicitly save for Map
                         'name': row.get('Building/Name', f"House {row['House_ID']}") 
                     })
                 except ValueError: continue
@@ -79,7 +83,7 @@ class RouteOptimizer:
             except:
                  c['trip1'] = (self._get_dist_km(start_coords, c['coords']) / self.KM_PER_MIN) * traffic_factor
 
-            # Trip 2 (Return Trip)
+            # Trip 2 (Return Trip if gap filling)
             if end_coords:
                 url2 = f"http://router.project-osrm.org/route/v1/driving/{c['coords'][1]},{c['coords'][0]};{end_coords[1]},{end_coords[0]}?overview=false"
                 try:
@@ -111,7 +115,6 @@ class RouteOptimizer:
                     current_time = job['end']; current_loc = job['coords']
                     continue
                 
-                # --- FOUND A GAP ---
                 return {
                     'type': 'gap',
                     'msg': f"Found Gap: {fmt(current_time)} - {fmt(job['start'])} ({int(gap_mins)} mins)",
@@ -183,16 +186,15 @@ class RouteOptimizer:
             shortlist.sort(key=lambda x: x['final_score'])
             return shortlist
 
-# --- UI INITIALIZATION ---
+# --- 3. UI LOGIC ---
 if 'schedule' not in st.session_state: st.session_state.schedule = []
-if 'last_scenario' not in st.session_state: st.session_state.last_scenario = None
 
-# Initialize Brain
+# Initialize Brain (Bangalore Coordinates)
 optimizer = RouteOptimizer(office_coords=(12.9716, 77.5946), day_start=9.0)
 optimizer.load_from_csv('Homes.csv')
 optimizer.schedule = st.session_state.schedule
 
-# --- SIDEBAR: SCHEDULE ---
+# --- SIDEBAR ---
 with st.sidebar:
     st.header("📅 Today's Plan")
     if not st.session_state.schedule:
@@ -212,7 +214,6 @@ with st.sidebar:
 # --- MAIN DASHBOARD ---
 st.title("🚛 Field Ops Optimizer")
 
-# Top Metrics
 col1, col2, col3 = st.columns(3)
 col1.metric("Pending Inspections", len(optimizer.candidates))
 col2.metric("Scheduled Visits", len(st.session_state.schedule))
@@ -220,7 +221,6 @@ col3.metric("Traffic Status", "Heavy (2.5x)" if optimizer._get_traffic_multiplie
 
 st.markdown("---")
 
-# --- AI CONTROLS ---
 col_ai_1, col_ai_2 = st.columns([1, 3])
 with col_ai_1:
     st.subheader("⚙️ Controls")
@@ -229,7 +229,7 @@ with col_ai_1:
 with col_ai_2:
     st.subheader("🧠 Recommendations")
     
-    # Run Analysis
+    # 1. Run Analysis
     scenario = optimizer.recommend_next_calls(skip=skip_val)
     
     if scenario['type'] == 'gap':
@@ -237,12 +237,18 @@ with col_ai_2:
     else:
         st.success(f"📍 **{scenario['msg']}**")
     
-    # Solve
+    # 2. Solve for Candidates
     results = optimizer.solve_recommendations(scenario)
 
     if results:
-        # MAP VIEW
+        # MAP VIEW (SAFE MODE)
         map_df = pd.DataFrame(results)
+        
+        # --- FIX: Ensure lat/lon columns exist ---
+        if 'lat' not in map_df.columns and 'coords' in map_df.columns:
+            map_df['lat'] = map_df['coords'].apply(lambda x: x[0])
+            map_df['lon'] = map_df['coords'].apply(lambda x: x[1])
+            
         st.map(map_df, latitude='lat', longitude='lon', size=20, zoom=11)
         
         # TABLE VIEW
@@ -261,16 +267,13 @@ with col_ai_2:
         with c1:
             selected_id = st.selectbox("Select Property:", options=[r['id'] for r in results], format_func=lambda x: next((r['name'] for r in results if r['id'] == x), x))
         with c2:
-            # Smart default time
             default_time = scenario['time']
             if scenario['type'] == 'gap':
-                # If gap starts at 9.0, suggest 9.0. If 9.25, suggest 9.5
                 default_time = math.ceil(scenario['time'] * 2) / 2
             
             book_time = st.number_input("Time (24h):", min_value=9.0, max_value=19.0, value=float(default_time), step=0.5)
 
         if st.button("Confirm Booking 🚀", type="primary", use_container_width=True):
-            # Find details
             house = next((r for r in results if r['id'] == selected_id), None)
             if house:
                 new_booking = {
