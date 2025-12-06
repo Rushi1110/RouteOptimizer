@@ -3,14 +3,14 @@ import pandas as pd
 import math
 import requests
 
-# --- 1. PAGE CONFIG (Must be the very first command) ---
+# --- 1. PAGE CONFIG ---
 st.set_page_config(
     page_title="Field Ops Optimizer",
     page_icon="🚛",
     layout="wide"
 )
 
-# --- 2. THE BRAIN (Logic Class) ---
+# --- 2. THE BRAIN ---
 class RouteOptimizer:
     def __init__(self, office_coords, day_start=9.0):
         self.office = office_coords
@@ -25,43 +25,47 @@ class RouteOptimizer:
 
     def _get_traffic_multiplier(self, hour_of_day):
         h = float(hour_of_day)
-        # Peak Hours (Bangalore/Mumbai Logic)
         if (8.5 <= h < 11.5) or (17.5 <= h < 20.5): return 2.5  
         elif 11.5 <= h < 17.5: return 1.8
         else: return 1.2
 
     def load_from_csv(self, file_path):
         try:
-            # Try reading with different encodings to handle emojis safely
             try:
                 df = pd.read_csv(file_path, encoding='utf-8')
             except UnicodeDecodeError:
                 df = pd.read_csv(file_path, encoding='cp1252')
             
-            # --- ROBUST FILTER ---
-            # Looks for "Inspection Pending" text, ignoring emojis/garbage characters
             if 'Internal/Status' in df.columns:
+                # Robust string matching for status
                 df = df[df['Internal/Status'].astype(str).str.contains("Inspection Pending", case=False, na=False)]
             
             self.candidates = [] 
             for index, row in df.iterrows():
                 try:
-                    # Clean Coordinates
                     raw_lat = str(row['Building/Lat']).replace('"', '').strip()
                     if ',' in raw_lat:
                         parts = raw_lat.split(',')
-                        lat = float(parts[0]); lon = float(parts[1])
+                        lat = float(parts[0].strip())
+                        lon = float(parts[1].strip())
                     else:
-                        lat = float(raw_lat); lon = float(str(row['Building/Long']).replace('"', '').strip())
+                        lat = float(raw_lat)
+                        lon = float(str(row['Building/Long']).replace('"', '').strip())
+
+                    # Skip if NaN (Not a Number)
+                    if math.isnan(lat) or math.isnan(lon):
+                        continue
 
                     self.candidates.append({
                         'id': row['House_ID'], 
                         'coords': (lat, lon), 
-                        'lat': lat, # Explicitly save for Map
-                        'lon': lon, # Explicitly save for Map
+                        'lat': lat, 
+                        'lon': lon, 
                         'name': row.get('Building/Name', f"House {row['House_ID']}") 
                     })
-                except ValueError: continue
+                except (ValueError, IndexError): 
+                    continue
+                    
         except FileNotFoundError: st.error("❌ Error: 'Homes.csv' file not found.")
 
     def _get_dist_km(self, coords1, coords2):
@@ -71,7 +75,6 @@ class RouteOptimizer:
         traffic_factor = self._get_traffic_multiplier(hour_of_day)
         
         for c in candidates:
-            # OSRM Call
             url = f"http://router.project-osrm.org/route/v1/driving/{start_coords[1]},{start_coords[0]};{c['coords'][1]},{c['coords'][0]}?overview=false"
             try:
                 r = requests.get(url, timeout=2)
@@ -83,7 +86,6 @@ class RouteOptimizer:
             except:
                  c['trip1'] = (self._get_dist_km(start_coords, c['coords']) / self.KM_PER_MIN) * traffic_factor
 
-            # Trip 2 (Return Trip if gap filling)
             if end_coords:
                 url2 = f"http://router.project-osrm.org/route/v1/driving/{c['coords'][1]},{c['coords'][0]};{end_coords[1]},{end_coords[0]}?overview=false"
                 try:
@@ -104,7 +106,6 @@ class RouteOptimizer:
         skipped_count = 0
         def fmt(t): return f"{int(t)}:{int((t-int(t))*60):02d}"
 
-        # 1. GAP ANALYSIS
         for job in self.schedule:
             gap_mins = (job['start'] - current_time) * 60
             min_gap = self.DEFAULT_MEETING_TIME + 15 
@@ -126,7 +127,6 @@ class RouteOptimizer:
 
             current_time = job['end']; current_loc = job['coords']
 
-        # --- END OF DAY ---
         return {
             'type': 'end',
             'msg': f"End of Day: Free after {fmt(current_time)}",
@@ -142,7 +142,6 @@ class RouteOptimizer:
         current_time = scenario['time']
         gap_mins = scenario['gap_duration']
 
-        # Physics Filter
         traffic_factor = self._get_traffic_multiplier(current_time)
         current_speed = self.BASE_SPEED_KMPH / traffic_factor
         travel_budget = gap_mins - self.DEFAULT_MEETING_TIME
@@ -154,7 +153,6 @@ class RouteOptimizer:
 
         survivors = []
         for c in self.candidates:
-            # Ignore already booked
             if any(j['id'] == c['id'] for j in self.schedule): continue
 
             d1 = self._get_dist_km(start_node, c['coords'])
@@ -162,17 +160,14 @@ class RouteOptimizer:
             if end_node:
                 d2 = self._get_dist_km(c['coords'], end_node)
             
-            # Filter Logic
             if end_node:
                 if ((d1 + d2) * self.ROAD_BUFFER) < max_detour_km + base_dist:
                     c['math_score'] = (d1 + d2) - base_dist
                     survivors.append(c)
             else:
-                # End of day: just nearest neighbors
                 c['math_score'] = d1
                 survivors.append(c)
 
-        # Sort & API Check
         shortlist = sorted(survivors, key=lambda x: x['math_score'])[:10]
         self.get_real_travel_time_batch(start_node, end_node, shortlist, hour_of_day=current_time)
 
@@ -189,7 +184,7 @@ class RouteOptimizer:
 # --- 3. UI LOGIC ---
 if 'schedule' not in st.session_state: st.session_state.schedule = []
 
-# Initialize Brain (Bangalore Coordinates)
+# Initialize Brain
 optimizer = RouteOptimizer(office_coords=(12.9716, 77.5946), day_start=9.0)
 optimizer.load_from_csv('Homes.csv')
 optimizer.schedule = st.session_state.schedule
@@ -224,12 +219,10 @@ st.markdown("---")
 col_ai_1, col_ai_2 = st.columns([1, 3])
 with col_ai_1:
     st.subheader("⚙️ Controls")
-    skip_val = st.number_input("Skip Gaps:", min_value=0, max_value=5, value=0, help="Skip early morning gaps if you want to book afternoon first.")
+    skip_val = st.number_input("Skip Gaps:", min_value=0, max_value=5, value=0, help="Skip early morning gaps.")
     
 with col_ai_2:
     st.subheader("🧠 Recommendations")
-    
-    # 1. Run Analysis
     scenario = optimizer.recommend_next_calls(skip=skip_val)
     
     if scenario['type'] == 'gap':
@@ -237,19 +230,27 @@ with col_ai_2:
     else:
         st.success(f"📍 **{scenario['msg']}**")
     
-    # 2. Solve for Candidates
     results = optimizer.solve_recommendations(scenario)
 
     if results:
-        # MAP VIEW (SAFE MODE)
-        map_df = pd.DataFrame(results)
+        # --- MAP VIEW (CRASH PROOF VERSION) ---
+        clean_map_data = []
+        for r in results:
+            try:
+                # FORCE FLOAT CONVERSION & CHECK NAN
+                lat = float(r.get('lat', r['coords'][0]))
+                lon = float(r.get('lon', r['coords'][1]))
+                
+                # Only add if Valid Number
+                if not math.isnan(lat) and not math.isnan(lon):
+                    clean_map_data.append({'lat': lat, 'lon': lon})
+            except (ValueError, TypeError):
+                continue
         
-        # --- FIX: Ensure lat/lon columns exist ---
-        if 'lat' not in map_df.columns and 'coords' in map_df.columns:
-            map_df['lat'] = map_df['coords'].apply(lambda x: x[0])
-            map_df['lon'] = map_df['coords'].apply(lambda x: x[1])
-            
-        st.map(map_df, latitude='lat', longitude='lon', size=20, zoom=11)
+        if clean_map_data:
+            st.map(pd.DataFrame(clean_map_data), size=20, zoom=11)
+        else:
+            st.warning("⚠️ Candidates found, but coordinates are invalid/missing for map.")
         
         # TABLE VIEW
         display_data = []
@@ -284,7 +285,6 @@ with col_ai_2:
                     'end': book_time + (50/60.0),
                     'duration': 50
                 }
-                # Check Overlap
                 overlap = False
                 for job in st.session_state.schedule:
                     if (new_booking['start'] < job['end']) and (new_booking['end'] > job['start']):
